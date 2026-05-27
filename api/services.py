@@ -1,32 +1,19 @@
 """
-Service layer — singleton ML resource loading and pipeline orchestration.
+Service layer — lazy ML loading for Render / Docker fast port bind.
 
-Why singleton loading matters:
-    Embedding models, Chroma clients, BM25 indexes, and cross-encoders are
-    expensive to load (seconds, hundreds of MB). Per-request initialization would
-    destroy latency SLOs and exhaust memory under concurrent traffic.
-
-Why APIs are critical for ML systems:
-    They decouple inference from notebooks/CLIs, enforce contracts (schemas),
-    and let you version, scale, and monitor the same pipeline in production.
-
-Why observability matters in production AI:
-    Request IDs, stage timings, and error rates distinguish retrieval failures
-    from generation timeouts — essential when debugging grounded RAG in prod.
+Heavy imports (Chroma, sentence-transformers, BM25, reranker) run only inside
+``ensure_initialized()`` on the first /ask or /retrieve request.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
 from collections import defaultdict
 from dataclasses import asdict
 from typing import Any
-
-from sentence_transformers import CrossEncoder
-
-from llm_client import LLMClient, LLMClientError
 
 from api.config import Settings, get_settings
 from api.serialization import (
@@ -48,10 +35,6 @@ from api.schemas import (
     RetrievedChunkSchema,
     SourceChunkSchema,
 )
-from grounded_qa import build_grounded_prompt, calculate_confidence, format_citations
-from hybrid_retriever import build_bm25_index, load_chunks
-from qa_pipeline import COLLECTION_NAME, load_vectorstore
-from reranker import load_cross_encoder, run_rerank_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +50,7 @@ def _confidence_bucket(score: float) -> str:
 
 
 class RequestMetrics:
-    """Thread-safe in-process metrics (replace with Prometheus — see TODO)."""
+    """Thread-safe in-process metrics."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -119,43 +102,67 @@ class RequestMetrics:
                     self._retrieve_latency_sum / ret_n if ret_n else 0.0
                 ),
                 confidence_distribution=ConfidenceDistribution(
-                    **{k: self._confidence_buckets.get(k, 0) for k in (
-                        "very_low", "low", "medium", "high"
-                    )}
+                    **{
+                        k: self._confidence_buckets.get(k, 0)
+                        for k in ("very_low", "low", "medium", "high")
+                    }
                 ),
                 uptime_seconds=time.perf_counter() - self._start_time,
             )
 
 
 class RAGService:
-    """
-    Production service holding warmed ML dependencies.
-
-    Load once at startup via ``initialize()``; serve many requests.
-    """
+    """Lazy singleton: ML resources load on first query, not at import time."""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.metrics = RequestMetrics()
-        self._initialized = False
+        self.initialized = False
         self._init_lock = threading.Lock()
+        self._async_init_lock = asyncio.Lock()
+        self._init_error: str | None = None
 
         self.vector_store: Any = None
         self.embeddings: Any = None
         self.bm25_index: Any = None
-        self.cross_encoder: CrossEncoder | None = None
-        self.llm_client: LLMClient | None = None
+        self.cross_encoder: Any = None
+        self.llm_client: Any = None
         self._chroma_count: int = 0
 
-    def initialize(self) -> None:
-        """Load models and indexes (idempotent)."""
+    async def ensure_initialized(self) -> None:
+        """Load ML stack once (thread pool); safe to await from async routes."""
+        if self.initialized:
+            return
+        if self._init_error:
+            raise RuntimeError(
+                f"RAG service failed to initialize: {self._init_error}. "
+                "Check chroma_db, processed_chunks.json, and /debug/status."
+            )
+
+        async with self._async_init_lock:
+            if self.initialized:
+                return
+            if self._init_error:
+                raise RuntimeError(self._init_error)
+            try:
+                await asyncio.to_thread(self._initialize_sync)
+            except Exception as exc:
+                self._init_error = str(exc)
+                logger.exception("[lazy-init] failed: %s", exc)
+                raise RuntimeError(self._init_error) from exc
+
+    def _initialize_sync(self) -> None:
         with self._init_lock:
-            if self._initialized:
+            if self.initialized:
                 return
 
-            logger.info("Initializing RAG service (singleton load)...")
+            print("[lazy-init] starting", flush=True)
             t0 = time.perf_counter()
 
+            print("[lazy-init] loading embeddings", flush=True)
+            from qa_pipeline import load_vectorstore
+
+            print("[lazy-init] loading chroma", flush=True)
             self.vector_store, self.embeddings = load_vectorstore(
                 self.settings.chroma_dir,
                 collection_name=self.settings.collection_name,
@@ -166,9 +173,18 @@ class RAGService:
             except Exception:
                 self._chroma_count = -1
 
+            from hybrid_retriever import build_bm25_index, load_chunks
+
             chunks = load_chunks(self.settings.chunks_path)
             self.bm25_index = build_bm25_index(chunks)
+
+            print("[lazy-init] loading reranker", flush=True)
+            from reranker import load_cross_encoder
+
             self.cross_encoder = load_cross_encoder(self.settings.cross_encoder_model)
+
+            from llm_client import LLMClient
+
             self.llm_client = LLMClient(
                 provider=self.settings.llm_provider,
                 model=self.settings.model_name,
@@ -179,25 +195,17 @@ class RAGService:
             llm_health = self._check_llm()
             if llm_health.status == "unavailable":
                 logger.warning(
-                    "LLM unavailable at startup: %s (POST /ask will return 503)",
+                    "LLM unavailable after init: %s (POST /ask may return 503)",
                     llm_health.detail,
                 )
 
-            self._initialized = True
+            self.initialized = True
+            elapsed = time.perf_counter() - t0
+            print(f"[lazy-init] complete ({elapsed:.2f}s)", flush=True)
             logger.info(
                 "RAG service ready in %.2fs (chroma_chunks=%d)",
-                time.perf_counter() - t0,
+                elapsed,
                 self._chroma_count,
-            )
-
-    def _ensure_ready(self) -> None:
-        if not self._initialized:
-            logger.info("Lazy-loading RAG service on first request...")
-            self.initialize()
-        if not self._initialized:
-            raise RuntimeError(
-                "RAG service not initialized. Ensure chroma_db and processed_chunks.json "
-                "exist at configured paths (see /debug/status)."
             )
 
     def _ensure_llm_ready(self) -> None:
@@ -237,8 +245,13 @@ class RAGService:
         verbose: bool,
         request_id: str,
     ) -> AskResponse:
-        """Full grounded QA: hybrid -> rerank -> LLM -> citations."""
-        self._ensure_ready()
+        """Full grounded QA (caller must await ensure_initialized first)."""
+        if not self.initialized:
+            raise RuntimeError("RAG service not initialized")
+
+        from grounded_qa import build_grounded_prompt, calculate_confidence, format_citations
+        from reranker import run_rerank_pipeline
+
         self._ensure_llm_ready()
 
         total_start = time.perf_counter()
@@ -260,32 +273,9 @@ class RAGService:
             final_k=top_k,
         )
         retrieval_rerank_s = time.perf_counter() - rerank_start
-        hybrid_ms = to_python_float(rerank_result.hybrid_latency_ms) or 0.0
-        rerank_ms = to_python_float(rerank_result.rerank_latency_ms) or 0.0
 
         hits = rerank_result.reranked_hits
-        logger.info(
-            "ask retrieval request_id=%s hybrid_candidates=%d reranked=%d "
-            "hybrid_ms=%.1f rerank_ms=%.1f",
-            request_id,
-            len(rerank_result.hybrid_hits),
-            len(hits),
-            hybrid_ms,
-            rerank_ms,
-        )
-
-        if not hits:
-            logger.warning("ask request_id=%s no chunks after rerank", request_id)
-
         messages, citation_map = build_grounded_prompt(question, hits)
-        prompt_chars = sum(len(m.content) for m in messages if hasattr(m, "content"))
-        logger.info(
-            "ask prompt request_id=%s prompt_chars=%d sources=%d",
-            request_id,
-            prompt_chars,
-            len(citation_map),
-        )
-
         gen_start = time.perf_counter()
         answer = self._generate(messages, request_id=request_id)
         generation_s = time.perf_counter() - gen_start
@@ -302,17 +292,6 @@ class RAGService:
         total_s = time.perf_counter() - total_start
         conf_score = to_python_float(confidence.score) or 0.0
         self.metrics.record_success("ask", float(total_s), conf_score)
-
-        logger.info(
-            "ask done request_id=%s retrieval_rerank_s=%.3f generation_s=%.3f "
-            "total_s=%.3f citations=%d confidence=%s",
-            request_id,
-            retrieval_rerank_s,
-            generation_s,
-            total_s,
-            len(citations),
-            confidence.level,
-        )
 
         return AskResponse(
             request_id=request_id,
@@ -346,10 +325,13 @@ class RAGService:
         include_text: bool,
         request_id: str,
     ) -> RetrieveResponse:
-        """Retrieval + rerank only (no LLM generation)."""
-        self._ensure_ready()
-        total_start = time.perf_counter()
+        """Retrieval + rerank only (caller must await ensure_initialized first)."""
+        if not self.initialized:
+            raise RuntimeError("RAG service not initialized")
 
+        from reranker import run_rerank_pipeline
+
+        total_start = time.perf_counter()
         rerank_result = run_rerank_pipeline(
             self.vector_store,
             self.bm25_index,
@@ -393,8 +375,9 @@ class RAGService:
         )
 
     def _generate(self, messages: list[Any], request_id: str = "") -> str:
-        """Invoke reused LLM client (Groq by default)."""
         assert self.llm_client is not None
+        from llm_client import LLMClientError
+
         try:
             result = self.llm_client.generate_with_metadata(messages)
         except LLMClientError as exc:
@@ -405,24 +388,29 @@ class RAGService:
                 self.settings.model_name,
             )
             raise RuntimeError(str(exc)) from exc
-        logger.info(
-            "LLM response request_id=%s answer_len=%d latency_ms=%.1f",
-            request_id,
-            len(result.text),
-            result.latency_ms,
-        )
         return result.text
 
     def get_debug_status(self) -> dict[str, Any]:
-        """Extended diagnostics for GET /debug/status."""
         chroma_path = str(self.settings.chroma_dir.resolve())
         chroma_exists = self.settings.chroma_dir.is_dir()
+        if not self.initialized:
+            return {
+                "initialized": False,
+                "init_error": self._init_error,
+                "chroma": {
+                    "path": chroma_path,
+                    "path_exists": chroma_exists,
+                    "detail": "ML not loaded",
+                },
+                "chunks_path": str(self.settings.chunks_path.resolve()),
+                "chunks_path_exists": self.settings.chunks_path.is_file(),
+            }
+
         llm = self._check_llm()
         chroma = self._check_chroma()
         embed = self._check_embeddings()
-
         return {
-            "initialized": self._initialized,
+            "initialized": True,
             "chroma": {
                 "status": chroma.status,
                 "path": chroma_path,
@@ -455,8 +443,23 @@ class RAGService:
         }
 
     def check_health(self) -> HealthResponse:
-        """Probe Chroma, embeddings, and LLM (Groq)."""
+        """Fast when ML is not loaded — no embedding probes."""
         settings = self.settings
+        if not self.initialized:
+            pending = ComponentHealth(
+                status="unavailable",
+                detail="ML not loaded (lazy init on first /ask or /retrieve)",
+            )
+            return HealthResponse(
+                status="degraded",
+                app_version=settings.app_version,
+                initialized=False,
+                chroma=pending,
+                llm=pending,
+                embeddings=pending,
+                ollama=pending,
+            )
+
         chroma_health = self._check_chroma()
         embed_health = self._check_embeddings()
         llm_health = self._check_llm()
@@ -472,6 +475,7 @@ class RAGService:
         return HealthResponse(
             status=overall,
             app_version=settings.app_version,
+            initialized=True,
             chroma=chroma_health,
             llm=llm_health,
             embeddings=embed_health,
@@ -479,29 +483,23 @@ class RAGService:
         )
 
     def _check_chroma(self) -> ComponentHealth:
-        if not self._initialized or self.vector_store is None:
-            return ComponentHealth(
-                status="unavailable",
-                detail="Service not initialized",
-            )
+        if not self.initialized or self.vector_store is None:
+            return ComponentHealth(status="unavailable", detail="Service not initialized")
         try:
             t0 = time.perf_counter()
             count = self.vector_store._collection.count()
             ms = (time.perf_counter() - t0) * 1000
             return ComponentHealth(
                 status="ok" if count > 0 else "degraded",
-                detail=f"collection={settings_collection()} chunks={count}",
+                detail=f"collection={self.settings.collection_name} chunks={count}",
                 latency_ms=round(ms, 2),
             )
         except Exception as exc:
             return ComponentHealth(status="unavailable", detail=str(exc))
 
     def _check_embeddings(self) -> ComponentHealth:
-        if not self._initialized or self.embeddings is None:
-            return ComponentHealth(
-                status="unavailable",
-                detail="Embeddings not loaded",
-            )
+        if not self.initialized or self.embeddings is None:
+            return ComponentHealth(status="unavailable", detail="Embeddings not loaded")
         try:
             t0 = time.perf_counter()
             _ = self.embeddings.embed_query("health check")
@@ -515,11 +513,8 @@ class RAGService:
             return ComponentHealth(status="unavailable", detail=str(exc))
 
     def _check_llm(self) -> ComponentHealth:
-        if not self._initialized or self.llm_client is None:
-            return ComponentHealth(
-                status="unavailable",
-                detail="LLM client not initialized",
-            )
+        if not self.initialized or self.llm_client is None:
+            return ComponentHealth(status="unavailable", detail="LLM client not initialized")
         try:
             probe = self.llm_client.health_check()
             return ComponentHealth(
@@ -531,11 +526,6 @@ class RAGService:
             return ComponentHealth(status="unavailable", detail=str(exc))
 
 
-def settings_collection() -> str:
-    return COLLECTION_NAME
-
-
-# Module-level singleton for dependency injection
 _service: RAGService | None = None
 _service_lock = threading.Lock()
 
@@ -549,7 +539,6 @@ def get_rag_service_instance() -> RAGService:
 
 
 def reset_rag_service() -> None:
-    """Test helper to reset singleton."""
     global _service
     with _service_lock:
         _service = None

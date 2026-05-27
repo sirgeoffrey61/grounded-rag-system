@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -21,19 +22,21 @@ router = APIRouter(tags=["retrieve"])
     summary="Retrieve and rerank chunks",
     description="Return top reranked chunks with similarity and reranker scores (no LLM).",
 )
-def retrieve_chunks(
+async def retrieve_chunks(
     body: RetrieveRequest,
     service: RAGServiceDep,
     request_id: RequestIdDep,
 ) -> RetrieveResponse:
+    await service.ensure_initialized()
     logger.info("retrieve request_id=%s top_k=%d", request_id, body.top_k)
     try:
-        return service.retrieve(
-            question=body.question,
-            top_k=body.top_k,
-            candidate_k=body.candidate_k,
-            include_text=body.include_text,
-            request_id=request_id,
+        return await asyncio.to_thread(
+            service.retrieve,
+            body.question,
+            body.top_k,
+            body.candidate_k,
+            body.include_text,
+            request_id,
         )
     except RuntimeError as exc:
         service.metrics.record_error()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -24,11 +25,12 @@ router = APIRouter(tags=["ask"])
         "Returns answer with validated citations and confidence."
     ),
 )
-def ask_question(
+async def ask_question(
     body: AskRequest,
     service: RAGServiceDep,
     request_id: RequestIdDep,
 ) -> AskResponse:
+    await service.ensure_initialized()
     logger.info(
         "ask endpoint request_id=%s question=%r top_k=%d",
         request_id,
@@ -36,12 +38,13 @@ def ask_question(
         body.top_k,
     )
     try:
-        return service.ask(
-            question=body.question,
-            top_k=body.top_k,
-            candidate_k=body.candidate_k,
-            verbose=body.verbose,
-            request_id=request_id,
+        return await asyncio.to_thread(
+            service.ask,
+            body.question,
+            body.top_k,
+            body.candidate_k,
+            body.verbose,
+            request_id,
         )
     except RuntimeError as exc:
         service.metrics.record_error()

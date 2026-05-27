@@ -162,6 +162,7 @@ class ComponentHealth(BaseModel):
 class HealthResponse(BaseModel):
     status: str  # healthy | degraded | unhealthy
     app_version: str
+    initialized: bool = False
     chroma: ComponentHealth
     llm: ComponentHealth
     embeddings: ComponentHealth
