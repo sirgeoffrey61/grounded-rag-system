@@ -1,0 +1,61 @@
+# =============================================================================
+# Grounded RAG API — Docker Compose (local / staging)
+# Build context: grounded-rag-system/
+# Prerequisites: python ingest.py (chroma_db + processed_chunks.json)
+# =============================================================================
+
+services:
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grounded-rag-api:latest
+    container_name: grounded-rag-api
+    restart: unless-stopped
+
+    ports:
+      - "${RAG_API_PORT:-8000}:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      RAG_API_HOST: "0.0.0.0"
+      RAG_API_PORT: "8000"
+      RAG_LOG_LEVEL: "${RAG_LOG_LEVEL:-INFO}"
+      RAG_DEBUG: "${RAG_DEBUG:-false}"
+
+      RAG_CHROMA_DIR: "/app/chroma_db"
+      RAG_CHUNKS_PATH: "/app/processed_chunks.json"
+      RAG_COLLECTION_NAME: "${RAG_COLLECTION_NAME:-quality_articles}"
+
+      RAG_EMBEDDING_MODEL: "${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
+      RAG_CROSS_ENCODER_MODEL: "${RAG_CROSS_ENCODER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}"
+
+      # Groq (production default)
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      RAG_LLM_PROVIDER: "${RAG_LLM_PROVIDER:-groq}"
+      RAG_MODEL_NAME: "${RAG_MODEL_NAME:-llama-3.1-8b-instant}"
+      RAG_LLM_TIMEOUT_SECONDS: "${RAG_LLM_TIMEOUT_SECONDS:-60}"
+
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./processed_chunks.json:/app/processed_chunks.json:ro
+      - rag_hf_cache:/app/.cache
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+volumes:
+  rag_hf_cache:

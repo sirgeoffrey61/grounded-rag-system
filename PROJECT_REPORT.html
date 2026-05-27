@@ -1,0 +1,532 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'/><style>
+body { font-family: Georgia, "Times New Roman", serif; font-size: 11pt;
+       line-height: 1.45; margin: 2cm; color: #111; }
+h1 { font-size: 22pt; border-bottom: 2px solid #333; padding-bottom: 6px;
+     margin-top: 0; page-break-before: always; }
+h1:first-of-type { page-break-before: avoid; }
+h2 { font-size: 16pt; margin-top: 1.2em; color: #1a365d; }
+h3 { font-size: 13pt; margin-top: 1em; color: #2d3748; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 10pt; }
+th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; vertical-align: top; }
+th { background: #f0f4f8; font-weight: bold; }
+code { background: #f5f5f5; padding: 1px 4px; font-size: 9pt; font-family: Consolas, monospace; }
+pre { background: #f5f5f5; padding: 10px; font-size: 8pt; white-space: pre-wrap;
+      font-family: Consolas, monospace; border: 1px solid #e2e8f0; }
+hr { border: none; border-top: 1px solid #ddd; margin: 2em 0; }
+ul, ol { margin: 0.5em 0 0.5em 1.2em; }
+p { margin: 0.6em 0; }
+strong { color: #1a202c; }
+</style></head><body><h1>Production-Grade Grounded RAG for Long-Document QA</h1>
+<p><strong>Project Type:</strong> End-to-end Retrieval-Augmented Generation (RAG) system with hybrid retrieval, cross-encoder reranking, citation-grounded generation, evaluation harness, REST API, containerization, and observability UI.</p>
+<p><strong>Author:</strong> <em>[Your Name]</em></p>
+<p><strong>Repository:</strong> <code>fruit-freshness-detection</code> (QuALITY RAG pipeline)</p>
+<p><strong>Primary Technologies:</strong> Python 3.12, LangChain, ChromaDB, sentence-transformers, rank-bm25, cross-encoder (MS MARCO MiniLM), Ollama (Mistral), FastAPI, Uvicorn, Streamlit, Docker, pandas, scikit-learn, matplotlib</p>
+<hr />
+<h2>Executive Summary</h2>
+<p>This project implements a <strong>production-oriented grounded RAG stack</strong> over the <strong>QuALITY v1.0.1</strong> long-document multiple-choice QA corpus. The system was built in twelve engineering phases: dataset exploration, ingestion and vector indexing, dense QA baseline, retrieval experimentation, hybrid sparse–dense retrieval, cross-encoder reranking, citation-grounded answer generation, automated evaluation, FastAPI serving, Docker packaging, and a Streamlit client that talks only to HTTP APIs.</p>
+<p>The design prioritizes <strong>trustworthiness over fluency</strong>: answers are constrained to retrieved passages, inline citations are validated against chunk metadata (never invented), temperature is set to zero, and the system is encouraged to abstain when context is insufficient. A parallel <strong>reliability engineering</strong> track measures article-level recall@k, reranker rank movement, citation validity, abstention rate, and heuristic confidence calibration.</p>
+<p>The result is not a notebook demo but a <strong>deployable inference surface</strong> (<code>POST /ask</code>, <code>POST /retrieve</code>, health and metrics endpoints) with structured logging, request IDs, dependency probes, and operational fixes discovered during integration (Chroma batch upserts, numpy JSON serialization, explicit Ollama health checks).</p>
+<hr />
+<h2>Problem Statement</h2>
+<p>Large language models excel at language but <strong>hallucinate</strong> when asked about facts outside their training window or when prompts lack grounding. In enterprise settings, unsupported claims create legal, compliance, and user-trust risk.</p>
+<p>Pure semantic retrieval on long documents introduces a second failure mode: <strong>the right article may be indexed, but the wrong chunk surfaces</strong> because embeddings average over 500-character windows, questions use different vocabulary than the source, or evidence spans multiple paragraphs. Keyword-only retrieval misses paraphrases.</p>
+<p>QuALITY amplifies these issues: articles are thousands of tokens, questions require multi-sentence reasoning, and writers composed questions after reading full documents—while the RAG system only sees fragments.</p>
+<p>This project addresses: <strong>(1)</strong> retrieval quality, <strong>(2)</strong> precision-oriented reranking, <strong>(3)</strong> grounded generation with traceable citations, and <strong>(4)</strong> measurable reliability rather than anecdotal demos.</p>
+<hr />
+<h2>Objectives</h2>
+<table>
+<thead>
+<tr>
+<th>Objective</th>
+<th>Implementation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trustworthy answers</td>
+<td>Grounded prompts, citation validation, abstention phrase</td>
+</tr>
+<tr>
+<td>Improve retrieval</td>
+<td>Hybrid dense + BM25, tunable top-k, chunking experiments</td>
+</tr>
+<tr>
+<td>Reduce hallucinations</td>
+<td>Context-only rules; no citation IDs beyond retrieval metadata</td>
+</tr>
+<tr>
+<td>Explainability</td>
+<td>Per-chunk <code>document_id</code>, <code>chunk_id</code>, scores, source type, confidence report</td>
+</tr>
+<tr>
+<td>Production readiness</td>
+<td>FastAPI singleton loading, health/metrics, Docker, structured logs</td>
+</tr>
+<tr>
+<td>Evaluation</td>
+<td><code>evaluate_rag.py</code> with CSV/JSON outputs and calibration buckets</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>System Architecture</h2>
+<h3>End-to-end data flow</h3>
+<pre><code>QuALITY JSONL (train/dev/test)
+        │
+        ▼
+┌───────────────────┐
+│  ingest.py        │  clean → chunk (500/50) → embed (MiniLM) → Chroma
+│  explore_dataset  │  + processed_chunks.json (BM25 corpus mirror)
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────────────────────────────────────────────┐
+│                    INFERENCE PATH                          │
+│  User query                                                │
+│     → hybrid_retriever (Chroma dense + BM25, merge 0.5/0.5)│
+│     → reranker (MS MARCO cross-encoder, pool 25 → top 5)   │
+│     → grounded_qa (numbered sources + Ollama mistral)      │
+│     → format_citations ([N] tags validated)                │
+│     → calculate_confidence (rerank + channel agreement)    │
+└───────────────────────────────────────────────────────────┘
+          │
+          ├─ CLI: grounded_qa.py, hybrid_retriever.py, reranker.py
+          ├─ API: api/ (FastAPI + RAGService singleton)
+          └─ UI: frontend/app.py → HTTP only (no in-process RAG imports)
+</code></pre>
+<h3>Layer responsibilities</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Ingestion</strong></td>
+<td>Deterministic chunking, embedding, persisted vectors + JSON chunk audit file</td>
+</tr>
+<tr>
+<td><strong>Retrieval</strong></td>
+<td>Candidate generation; hybrid fusion increases recall before reranking</td>
+</tr>
+<tr>
+<td><strong>Reranking</strong></td>
+<td>Cross-encoder scores (query, passage) pairs; promotes semantically relevant chunks</td>
+</tr>
+<tr>
+<td><strong>Generation</strong></td>
+<td>Ollama Mistral with strict system prompt; citations required when answering</td>
+</tr>
+<tr>
+<td><strong>Serving</strong></td>
+<td>FastAPI validates I/O with Pydantic; sanitizes numeric types for JSON</td>
+</tr>
+<tr>
+<td><strong>Evaluation</strong></td>
+<td>Batch QuALITY dev queries; aggregates reliability metrics</td>
+</tr>
+<tr>
+<td><strong>Deployment</strong></td>
+<td>Docker image for API; Chroma and BM25 corpus mounted as volumes</td>
+</tr>
+</tbody>
+</table>
+<h3>API architecture</h3>
+<ul>
+<li><strong><code>api/main.py</code>:</strong> App factory, lifespan (warm models at startup), CORS, request-ID middleware, global exception handler.</li>
+<li><strong><code>api/services.py</code>:</strong> <code>RAGService</code> singleton—Chroma, BM25 index, cross-encoder, <code>ChatOllama</code> client reused per request.</li>
+<li><strong><code>api/schemas.py</code>:</strong> Request/response contracts (<code>AskRequest</code>, <code>AskResponse</code>, <code>RetrieveResponse</code>, <code>HealthResponse</code>, <code>MetricsResponse</code>).</li>
+<li><strong><code>api/serialization.py</code>:</strong> Converts numpy scalars to native Python floats (FastAPI <code>jsonable_encoder</code> fails on <code>numpy.float32</code>).</li>
+<li><strong>Routers:</strong> <code>ask</code>, <code>retrieve</code>, <code>health</code>, <code>metrics</code>, <code>debug</code>.</li>
+</ul>
+<p>Ollama runs <strong>outside</strong> the Docker container by default (<code>host.docker.internal:11434</code> in Compose).</p>
+<hr />
+<h2>Dataset Analysis</h2>
+<h3>QuALITY v1.0.1</h3>
+<ul>
+<li><strong>Format:</strong> JSON Lines—one record per writer–article pair with nested <code>questions</code> (multiple choice, <code>gold_label</code>).</li>
+<li><strong>Location in repo:</strong> <code>data/quality/v1.0.1/</code> (files such as <code>QuALITY.v1.0.1.train</code>, <code>.dev</code>, <code>.test</code>; extensionless JSONL supported).</li>
+<li><strong>Exploration:</strong> <code>explore_dataset.py</code> discovers splits, flattens questions, reports document/question counts and length statistics.</li>
+</ul>
+<h3>Why long-document QA is hard for RAG</h3>
+<ol>
+<li><strong>Evidence fragmentation:</strong> A correct answer may require two non-adjacent paragraphs; a single 500-character chunk may contain no decisive sentence.</li>
+<li><strong>Vocabulary mismatch:</strong> Questions are paraphrased relative to article wording—dense retrieval helps; BM25 helps on rare terms.</li>
+<li><strong>Low similarity scores:</strong> When many chunks are weak matches, reranking and hybrid fusion matter more than raw top-1 dense score.</li>
+<li><strong>No page metadata:</strong> QuALITY does not provide page numbers; retrieval is chunk- and article-level only.</li>
+</ol>
+<p>Ingestion <strong>deduplicates by <code>article_id</code></strong> (optional) so duplicate writer lines do not multiply index size; <code>document_id</code> comes from <code>set_unique_id</code>.</p>
+<hr />
+<h2>Detailed Implementation</h2>
+<h3>Phase 1 — <code>explore_dataset.py</code></h3>
+<p>Loads train/dev/test JSONL, normalizes HTML-stripped vs raw articles, emits <code>QuestionRecord</code> rows for analytics. Establishes file-discovery logic reused by ingest (handles QuALITY’s extensionless <code>.train</code> filenames).</p>
+<h3>Phase 2 — <code>ingest.py</code></h3>
+<p><strong>Pipeline:</strong> load → <code>clean_text</code> → <code>RecursiveCharacterTextSplitter</code> (<strong>500</strong> chars, <strong>50</strong> overlap) → <code>sentence-transformers/all-MiniLM-L6-v2</code> → Chroma collection <code>quality_articles</code>.</p>
+<p><strong>Engineering decisions:</strong></p>
+<ul>
+<li><strong>Batched Chroma upserts (500 docs/batch):</strong> Full 25k+ single insert crashed; batching stabilized ingest.</li>
+<li><strong>Scalar metadata only:</strong> <code>document_id</code>, <code>chunk_id</code>, <code>split</code> (and related fields in chunk JSON)—keeps Chroma filters simple.</li>
+<li><strong><code>processed_chunks.json</code>:</strong> Mirror of chunk text for BM25 without round-tripping Chroma on every index build.</li>
+</ul>
+<p><strong>Typical scale after ingest:</strong> on the order of <strong>~25,700 chunks</strong> and <strong>~380 deduplicated documents</strong> (as logged at API startup in development runs).</p>
+<h3>Phase 4 — <code>qa_pipeline.py</code> (dense baseline)</h3>
+<p>Early end-to-end path: Chroma similarity search → context block → Ollama Mistral (<code>temperature=0</code>). Exposes <code>load_vectorstore</code>, <code>retrieve_chunks</code>, <code>run_pipeline</code>. Serves as the embedding/Chroma integration layer reused by hybrid retrieval and the API.</p>
+<p><em>Note: There is no separate <code>retrieve.py</code>; dense retrieval lives here.</em></p>
+<h3>Phase 5 — <code>retrieval_experiments.py</code></h3>
+<p>Systematic grid over <strong>top-k</strong> ∈ {3,5,10,15}, <strong>chunk sizes</strong> ∈ {256,512,1024}, <strong>overlaps</strong> ∈ {20,50,100,150}. Outputs <code>retrieval_results.csv</code> and <code>experiment_logs/</code>. Finding documented in code/comments: <strong>higher k lowers average similarity</strong>—a useful diagnostic for score calibration, not raw accuracy.</p>
+<h3>Phase 6 — <code>hybrid_retriever.py</code></h3>
+<ul>
+<li><strong>Dense:</strong> LangChain Chroma similarity with scores.</li>
+<li><strong>Sparse:</strong> <code>BM25Okapi</code> over tokenized <code>processed_chunks.json</code>.</li>
+<li><strong>Fusion:</strong> Normalize scores per channel; merge with <strong>DENSE_WEIGHT = 0.5</strong>, <strong>BM25_WEIGHT = 0.5</strong>; dedupe by <code>chunk_id</code>; tag <code>source_type</code> as <code>dense</code>, <code>bm25</code>, or <code>hybrid</code>.</li>
+<li><strong>CLI:</strong> Single-query mode and <code>--compare</code> benchmark exporting <code>hybrid_comparison.csv</code>.</li>
+</ul>
+<h3>Phase 7 — <code>reranker.py</code></h3>
+<ul>
+<li>Model: <strong><code>cross-encoder/ms-marco-MiniLM-L-6-v2</code></strong></li>
+<li>Default <strong>candidate_k = 25</strong> (hybrid pool), <strong>final_k = 5</strong></li>
+<li>Records <code>hybrid_rank</code>, <code>rerank_rank</code>, <code>rank_delta</code> for observability</li>
+<li>Outputs <code>reranked_results.csv</code>, logs under <code>experiment_logs/reranking/</code></li>
+</ul>
+<h3>Phase 8 — <code>grounded_qa.py</code></h3>
+<ul>
+<li>Builds numbered <code>[SOURCE N]</code> blocks with <code>document_id</code>, <code>chunk_id</code>, <code>article_id</code>, <code>split</code>, retrieval channel, rerank score</li>
+<li><strong><code>format_citations</code>:</strong> Regex <code>[N]</code>; ignores unknown IDs (anti-hallucination for references)</li>
+<li><strong><code>calculate_confidence</code>:</strong> Sigmoid-normalized rerank scores, spread, hybrid/dual-channel ratios → <code>low</code> / <code>medium</code> / <code>high</code></li>
+<li>Persists <code>grounded_answers.json</code>, per-run logs under <code>experiment_logs/grounded_qa/</code></li>
+</ul>
+<h3>Phase 9 — <code>evaluate_rag.py</code></h3>
+<p>Samples QuALITY <strong>dev</strong> questions (<code>load_benchmark_queries</code>), runs hybrid + rerank + optional grounded QA, computes:</p>
+<ul>
+<li>Article-level <strong>recall@k</strong> (gold <code>article_id</code> in top-k chunks—standard proxy without span labels)</li>
+<li>Reranking movement (median rank delta, promotions)</li>
+<li>Grounding: abstention, unsupported answers (non-abstention with zero valid citations), invalid citation tags</li>
+<li>Confidence buckets + Brier score vs recall (when sample size sufficient)</li>
+</ul>
+<p>Outputs: <code>evaluation_results.csv</code>, <code>reliability_report.json</code>, <code>confidence_analysis.csv</code>, plots under <code>experiment_logs/evaluation/</code>.</p>
+<p><strong>Sample result (3 dev queries, retrieval-only run, <code>reliability_report.json</code>):</strong> mean recall@5 and @final_k = <strong>1.0</strong>; mean hybrid score ≈ <strong>0.84</strong>; median rank delta <strong>8.0</strong>; confidence mean ≈ <strong>0.53</strong> (medium bucket). Full grounding metrics require runs without <code>--skip-llm</code>.</p>
+<h3>Phase 10 — FastAPI (<code>api/</code>)</h3>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /ask</code></td>
+<td>Full grounded QA</td>
+</tr>
+<tr>
+<td><code>POST /retrieve</code></td>
+<td>Hybrid + rerank only</td>
+</tr>
+<tr>
+<td><code>GET /health</code></td>
+<td>Chroma, embeddings, Ollama probes</td>
+</tr>
+<tr>
+<td><code>GET /metrics</code></td>
+<td>In-process counters, latency averages, confidence histogram</td>
+</tr>
+<tr>
+<td><code>GET /debug/status</code></td>
+<td>Extended diagnostics (paths, model loaded flags, collection count)</td>
+</tr>
+</tbody>
+</table>
+<p>Startup loads all models once (~20–60s first boot). Request middleware adds <strong><code>X-Request-ID</code></strong> and latency logging.</p>
+<h3>Phase 11 — Docker</h3>
+<ul>
+<li><strong><code>Dockerfile</code>:</strong> <code>python:3.12-slim</code>, installs <code>RAG_REQUIREMENTS.txt</code> (excludes <code>tf-keras</code> in image), non-root user, healthcheck on <code>/health</code></li>
+<li><strong><code>docker-compose.yml</code>:</strong> Mounts <code>./chroma_db</code>, <code>./processed_chunks.json</code>, HF cache volume; <code>RAG_OLLAMA_BASE_URL=http://host.docker.internal:11434</code></li>
+<li><strong><code>.env.example</code>:</strong> <code>RAG_*</code> settings documented</li>
+</ul>
+<h3>Phase 12 — <code>frontend/app.py</code></h3>
+<p>Streamlit UI: chat-style assistant, citation/source expanders, confidence badges, retrieval score tables, Health and Metrics tabs. Communicates <strong>only</strong> via <code>requests</code> to the API (<code>RAG_UI_API_BASE_URL</code>, <code>RAG_UI_API_TIMEOUT</code>). Improved error display: HTTP status, backend <code>detail</code>, request ID.</p>
+<hr />
+<h2>Retrieval Engineering</h2>
+<h3>Dense retrieval (Chroma + MiniLM)</h3>
+<p><strong>Strengths:</strong> Paraphrase tolerance; good for conceptual questions.<br />
+<strong>Weaknesses:</strong> Long chunks dilute vectors; uniformly low scores on hard queries.</p>
+<h3>BM25 (rank-bm25)</h3>
+<p>Built from the same chunk inventory as Chroma. <strong>Strengths:</strong> Exact token overlap, rare entities. <strong>Weaknesses:</strong> No semantic generalization.</p>
+<h3>Hybrid fusion</h3>
+<p>Parallel top-k from each channel (up to ~2k unique candidates before cut), score normalization, weighted sum, provenance in <code>source_type</code>. Tradeoff: tuning weights (currently 50/50) shifts precision/recall balance; no learned fusion in this codebase.</p>
+<h3>Cross-encoder reranking</h3>
+<p>Re-scores up to 25 candidates with a transformer trained on MS MARCO passage ranking. <strong>Effect:</strong> Chunks that are query-relevant but poorly ranked by hybrid score can move into the top 5—observed <strong>rank_delta</strong> values in evaluation (e.g., median 8 on a 3-query sample). Cost: ~400ms CPU rerank latency per query in logged runs.</p>
+<h3>Semantic drift and query formulation</h3>
+<p>Benchmark queries like <em>"What happened during the speed validation?"</em> may retrieve lexically similar but <strong>wrong-article</strong> chunks (e.g., “validation” in unrelated contexts). The system correctly <strong>abstained</strong> in grounded runs when evidence was insufficient—demonstrating grounding policy over creative completion.</p>
+<h3>Top-k and chunking experiments</h3>
+<p><code>retrieval_experiments.py</code> documents tradeoffs:</p>
+<ul>
+<li>Smaller chunks (256): sharper matches, boundary splits</li>
+<li>Larger chunks (1024): more context, noisier embeddings</li>
+<li>Overlap: reduces edge-cutting at cost of redundancy in top-k slots</li>
+</ul>
+<p>Production ingest uses <strong>500/50</strong> as the balanced default baked into <code>chroma_db</code>.</p>
+<hr />
+<h2>Grounding and Reliability</h2>
+<h3>Citation validation</h3>
+<p>Citations are <strong>only</strong> <code>[N]</code> tags present in the model output that match <code>citation_map</code> built from reranked hits. Unknown tags are dropped server-side— the API never fabricates bibliographic metadata.</p>
+<h3>Confidence scoring</h3>
+<p>Heuristic (not calibrated probability): sigmoid of rerank logits, score spread, fraction of <code>hybrid</code> source types, dual-channel (dense + BM25) presence. Levels: <strong>low</strong> (&lt;0.35), <strong>medium</strong>, <strong>high</strong> (≥0.55). Intended for <strong>gating and dashboards</strong>, not automated legal decisions without further calibration.</p>
+<h3>Abstention</h3>
+<p>System prompt mandates exact phrase <em>"I cannot answer from the provided context."</em> when evidence is missing. Evaluation tracks <strong>abstention_rate</strong> and <strong>unsupported_answer_rate</strong> (answered without valid citations).</p>
+<h3>Hallucination reduction mechanisms</h3>
+<ol>
+<li>Retrieved-only context in prompt  </li>
+<li>Temperature 0  </li>
+<li>Post-hoc citation validation  </li>
+<li>Refusal instruction  </li>
+<li>Evaluation pipeline to measure violations  </li>
+</ol>
+<hr />
+<h2>Evaluation</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Definition in this codebase</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>recall@k</strong></td>
+<td>Fraction of queries where any top-k chunk’s <code>article_id</code> matches QuALITY gold article</td>
+</tr>
+<tr>
+<td><strong>rerank movement</strong></td>
+<td><code>hybrid_rank - rerank_rank</code>; promotions into top-k</td>
+</tr>
+<tr>
+<td><strong>citation validity</strong></td>
+<td>Valid <code>[N]</code> / all tags; invalid tag rate</td>
+</tr>
+<tr>
+<td><strong>abstention rate</strong></td>
+<td>Heuristic phrase match on answer</td>
+</tr>
+<tr>
+<td><strong>confidence calibration</strong></td>
+<td>Bucketed confidence vs recall (Brier when n sufficient)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Limitation:</strong> Article-level recall does not measure multiple-choice accuracy against <code>gold_label</code>; RAGAS / human eval are listed as TODOs in <code>evaluate_rag.py</code>.</p>
+<hr />
+<h2>Backend and Deployment</h2>
+<h3>Operational model</h3>
+<ul>
+<li><strong>Singleton <code>RAGService</code>:</strong> One embedding model, one Chroma client, one BM25 index, one cross-encoder, one Ollama client per process.</li>
+<li><strong>Health:</strong> 503 when overall unhealthy; probes Chroma count, embedding embed test, Ollama <code>/api/tags</code> + model name match.</li>
+<li><strong>Metrics:</strong> Thread-safe counters—total/ask/retrieve requests, errors, mean latencies, confidence bucket counts.</li>
+</ul>
+<h3>Environment variables (<code>RAG_</code> prefix)</h3>
+<p>Examples: <code>RAG_CHROMA_DIR</code>, <code>RAG_CHUNKS_PATH</code>, <code>RAG_OLLAMA_BASE_URL</code>, <code>RAG_OLLAMA_MODEL</code>, <code>RAG_LOG_LEVEL</code>, <code>RAG_API_PORT</code>.</p>
+<h3>Run commands</h3>
+<pre><code class="language-bash"># Ingest (once)
+python ingest.py --data-dir data/quality/v1.0.1
+
+# API
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+
+# UI
+streamlit run frontend/app.py
+
+# Evaluation
+python evaluate_rag.py --split dev --max-queries 25
+python evaluate_rag.py --max-queries 10 --skip-llm
+
+# Docker
+docker compose up --build
+</code></pre>
+<hr />
+<h2>Challenges Faced</h2>
+<table>
+<thead>
+<tr>
+<th>Challenge</th>
+<th>Resolution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Chroma single bulk insert crash</strong></td>
+<td>Batched upserts (500); simplified metadata</td>
+</tr>
+<tr>
+<td><strong>QuALITY filename discovery</strong></td>
+<td>Custom <code>_is_jsonl_file()</code> for <code>.train</code> suffix</td>
+</tr>
+<tr>
+<td><strong>Windows console Unicode</strong></td>
+<td>ASCII-only in CLI <code>print</code> (no →, ∩)</td>
+</tr>
+<tr>
+<td><strong>Ollama not on PATH</strong></td>
+<td>Document <code>%LOCALAPPDATA%\Programs\Ollama\ollama.exe</code></td>
+</tr>
+<tr>
+<td><strong>TensorFlow / transformers conflict</strong></td>
+<td>Optional <code>tf-keras</code> in requirements on TF hosts</td>
+</tr>
+<tr>
+<td><strong>Generic HTTP 500 on <code>/ask</code></strong></td>
+<td>Root cause: <code>numpy.float32</code> in JSON response; fixed via <code>api/serialization.py</code> and <code>float()</code> at source</td>
+</tr>
+<tr>
+<td><strong><code>CitationSource</code> has <code>text_preview</code> not <code>text</code></strong></td>
+<td>API used wrong field; fixed to use reranked hit text when <code>verbose=True</code></td>
+</tr>
+<tr>
+<td><strong>Hard QuALITY queries</strong></td>
+<td>Low confidence and abstention—expected grounded behavior</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>Key Learnings</h2>
+<ol>
+<li><strong>Retrieval dominates the error budget</strong>—no reranker or prompt fixes wrong-corpus retrieval.  </li>
+<li><strong>Hybrid retrieval is cheap insurance</strong> against sparse/dense failure modes on long-form text.  </li>
+<li><strong>Production ML is mostly engineering:</strong> batching, serialization, health checks, request IDs, and clear 503s for Ollama outages.  </li>
+<li><strong>Grounding is a system property</strong>, not a prompt trick—validation, abstention, and metrics must align.  </li>
+<li><strong>Scores are not probabilities</strong>—cross-encoder logits and hybrid scores need explicit calibration before user-facing trust labels.</li>
+</ol>
+<hr />
+<h2>Future Improvements</h2>
+<p>Documented TODOs in code (not implemented):</p>
+<ul>
+<li>RAGAS / human evaluation (<code>evaluate_rag.py</code>)</li>
+<li>API authentication, rate limiting, streaming (<code>api/main.py</code>)</li>
+<li>Prometheus metrics, Redis caching, async inference queues</li>
+<li>GPU images, Kubernetes (Helm, PVC for Chroma), distributed retrieval vs generation services</li>
+<li>Graph RAG, agentic RAG, query rewriting, adaptive confidence thresholds</li>
+<li>Inline citation highlighting, conversational memory (Streamlit / grounded_qa)</li>
+</ul>
+<hr />
+<h2>Conclusion</h2>
+<p>The repository delivers a <strong>coherent, phase-documented RAG platform</strong> from raw QuALITY JSONL through hybrid retrieval, reranking, grounded generation with citations, quantitative evaluation, and a deployable FastAPI + Streamlit surface. Engineering effort concentrated on <strong>reliability and observability</strong>: singleton serving, health probes, numpy-safe JSON, volume-mounted vector stores, and explicit abstention policy.</p>
+<p>For enterprise GenAI teams, the project demonstrates familiarity with <strong>retrieval fusion, cross-encoder reranking, grounded generation contracts, and ML ops basics</strong>—the minimum bar for moving RAG from demo to diagnosable service.</p>
+<hr />
+<h2>Appendix</h2>
+<h3>A. Repository layout (principal artifacts)</h3>
+<pre><code>fruit-freshness-detection/
+├── data/quality/v1.0.1/          # QuALITY JSONL (not always in git)
+├── chroma_db/                     # Persisted vectors (generated)
+├── processed_chunks.json           # BM25 + audit corpus (generated)
+├── explore_dataset.py              # Phase 1
+├── ingest.py                       # Phase 2
+├── qa_pipeline.py                  # Phase 4 — dense QA + vectorstore helpers
+├── retrieval_experiments.py        # Phase 5
+├── hybrid_retriever.py             # Phase 6
+├── reranker.py                     # Phase 7
+├── grounded_qa.py                  # Phase 8
+├── evaluate_rag.py                 # Phase 9
+├── api/                            # Phase 10 — FastAPI
+│   ├── main.py
+│   ├── config.py
+│   ├── schemas.py
+│   ├── services.py
+│   ├── serialization.py
+│   ├── dependencies.py
+│   └── routers/ (ask, retrieve, health, metrics, debug)
+├── frontend/app.py                 # Phase 12 — Streamlit
+├── Dockerfile                      # Phase 11
+├── docker-compose.yml
+├── .env.example
+├── RAG_REQUIREMENTS.txt
+├── grounded_answers.json           # Grounded run history (generated)
+├── evaluation_results.csv          # (generated)
+├── reliability_report.json         # (generated)
+└── experiment_logs/                # Per-phase run logs (generated)
+</code></pre>
+<h3>B. Model and index configuration</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Embedding model</td>
+<td><code>sentence-transformers/all-MiniLM-L6-v2</code></td>
+</tr>
+<tr>
+<td>Chroma collection</td>
+<td><code>quality_articles</code></td>
+</tr>
+<tr>
+<td>Chunking (production ingest)</td>
+<td>500 chars, 50 overlap</td>
+</tr>
+<tr>
+<td>Cross-encoder</td>
+<td><code>cross-encoder/ms-marco-MiniLM-L-6-v2</code></td>
+</tr>
+<tr>
+<td>Hybrid weights</td>
+<td>0.5 dense / 0.5 BM25</td>
+</tr>
+<tr>
+<td>Default candidate_k / top_k</td>
+<td>25 / 5</td>
+</tr>
+<tr>
+<td>LLM</td>
+<td>Ollama <code>mistral</code> @ <code>http://localhost:11434</code></td>
+</tr>
+</tbody>
+</table>
+<h3>C. API reference</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Body / notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>POST</td>
+<td><code>/ask</code></td>
+<td><code>{ "question", "top_k", "candidate_k", "verbose" }</code></td>
+</tr>
+<tr>
+<td>POST</td>
+<td><code>/retrieve</code></td>
+<td><code>{ "question", "top_k", "candidate_k", "include_text" }</code></td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/health</code></td>
+<td>Component status</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/metrics</code></td>
+<td>Request stats</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/debug/status</code></td>
+<td>Extended diagnostics</td>
+</tr>
+<tr>
+<td>GET</td>
+<td><code>/docs</code></td>
+<td>OpenAPI (Swagger)</td>
+</tr>
+</tbody>
+</table>
+<h3>D. NotebookLM / audio narrative hook</h3>
+<p><em>Suggested story arc for audio overview:</em> Start with enterprise hallucination risk on long documents → introduce QuALITY as stress test → walk through ingest and why chunk overlap matters → explain why hybrid beats single-channel retrieval → reranker as precision layer → grounded citations and abstention as trust layer → evaluation and API as production closure → close with real bugs fixed (Chroma batching, numpy JSON) as evidence of operational maturity.</p>
+<hr />
+<p><em>Report generated from implemented source in this repository. Metrics cited from <code>reliability_report.json</code> and development logs unless otherwise noted.</em></p></body></html>

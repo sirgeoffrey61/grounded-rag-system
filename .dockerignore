@@ -1,0 +1,69 @@
+# =============================================================================
+# Docker build context exclusions — smaller, faster, safer images
+# =============================================================================
+
+# Python / virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# IDE / editor
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# Experiment outputs and logs (not needed at runtime)
+experiment_logs/
+*.csv
+grounded_answers.json
+reliability_report.json
+evaluation_results.csv
+confidence_analysis.csv
+retrieval_results.csv
+reranked_results.csv
+hybrid_comparison.csv
+
+# Vector DB and large data — mounted as volumes, not baked into image
+chroma_db/
+data/
+
+# Large / generated artifacts
+processed_chunks.json
+*.zip
+*.tar
+*.tar.gz
+*.pdf
+
+# Model caches (downloaded at runtime or via named volume)
+.cache/
+**/.cache/
+models/
+
+# Docker files (not needed inside image)
+Dockerfile
+docker-compose.yml
+.dockerignore
+.env
+.env.*
+
+# Docs / misc
+*.md
+!requirements.txt
+agent-transcripts/
+
+# OS
+.DS_Store
+Thumbs.db

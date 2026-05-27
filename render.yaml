@@ -1,0 +1,26 @@
+# Render Blueprint — Grounded RAG API (Groq)
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: grounded-rag-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: RAG_LLM_PROVIDER
+        value: groq
+      - key: RAG_MODEL_NAME
+        value: llama-3.1-8b-instant
+      - key: RAG_CHROMA_DIR
+        value: /app/chroma_db
+      - key: RAG_CHUNKS_PATH
+        value: /app/processed_chunks.json
+      - key: RAG_LOG_LEVEL
+        value: INFO
+    disk:
+      name: chroma-data
+      mountPath: /app/chroma_db
+      sizeGB: 1

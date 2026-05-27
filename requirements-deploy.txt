@@ -1,0 +1,2 @@
+# Minimal deps for API deploy (Render / Railway)
+-r requirements.txt
