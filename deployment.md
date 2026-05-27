@@ -47,7 +47,7 @@ Copy [production.env.example](production.env.example) or [.env.example](.env.exa
 2. Use [render.yaml](render.yaml) or create a **Web Service**:
    - **Root directory:** `grounded-rag-system/` (Blueprint [render.yaml](render.yaml))
    - **Build:** Docker (`Dockerfile`) or `pip install -r requirements.txt`
-   - **Start:** `uvicorn api.main:app --host 0.0.0.0 --port $PORT` (Render sets `PORT`)
+   - **Start:** use Dockerfile `CMD` (binds `0.0.0.0:10000`; set `PORT=10000` on Render)
 3. **Environment:** add `GROQ_API_KEY`, `RAG_MODEL_NAME`, paths for Chroma.
 4. **Disk:** attach a persistent disk mounted at `/app/chroma_db` *or* bake `chroma_db/` into the image after running `ingest.py` locally.
 5. **Health check path:** `/health` (expects 200 when Chroma + embeddings + Groq are OK).
@@ -98,8 +98,8 @@ curl -sS http://localhost:8000/health | jq .
 | Target | Command |
 |--------|---------|
 | Local | `uvicorn api.main:app --reload --host 0.0.0.0 --port 8000` |
-| Docker | `uvicorn api.main:app --host 0.0.0.0 --port 8000` |
-| Render | `uvicorn api.main:app --host 0.0.0.0 --port $PORT` |
+| Docker | Dockerfile `CMD` → `0.0.0.0:10000` (compose maps host `8000:10000`) |
+| Render | Dockerfile `CMD` → `0.0.0.0:10000`; env `PORT=10000` in `render.yaml` |
 
 First request after cold start may take 1–3 minutes while embedding and cross-encoder models load.
 

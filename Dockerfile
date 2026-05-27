@@ -36,9 +36,12 @@ RUN useradd --create-home --uid 1000 appuser \
     && chown -R appuser:appuser /app
 USER appuser
 
-EXPOSE 8000
+# Render scans EXPOSE and expects the process to listen on this port (often PORT=10000).
+ENV PORT=10000
+
+EXPOSE 10000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
-    CMD curl -f http://127.0.0.1:8000/health || exit 1
+    CMD curl -f http://127.0.0.1:10000/health || exit 1
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "10000"]

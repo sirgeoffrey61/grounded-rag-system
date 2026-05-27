@@ -7,7 +7,10 @@ services:
     dockerfilePath: ./Dockerfile
     plan: starter
     healthCheckPath: /health
+    # Dockerfile CMD binds 0.0.0.0:10000 — PORT must match for Render port detection.
     envVars:
+      - key: PORT
+        value: "10000"
       - key: GROQ_API_KEY
         sync: false
       - key: RAG_LLM_PROVIDER
