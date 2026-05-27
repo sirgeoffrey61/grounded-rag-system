@@ -33,10 +33,19 @@ Example requests:
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+
+# Early boot log (before heavy ML imports complete) — helps Render/Docker crash diagnosis.
+print(
+    f"[boot] api.main import start PORT={os.environ.get('PORT', '(unset)')} "
+    f"RAG_CHROMA_DIR={os.environ.get('RAG_CHROMA_DIR', '(unset)')}",
+    flush=True,
+)
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,21 +63,52 @@ def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=LOG_FORMAT)
 
 
+def _background_initialize(service: object) -> None:
+    """Warm ML indexes in a daemon thread so uvicorn can bind the port immediately."""
+    logger = logging.getLogger(__name__)
+    logger.info("Background ML initialization starting...")
+    try:
+        service.initialize()  # type: ignore[attr-defined]
+        logger.info("Background ML initialization finished")
+    except Exception as exc:
+        logger.exception(
+            "Background ML initialization failed (API remains up; /health will be degraded): %s",
+            exc,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Load ML resources at startup; release on shutdown."""
+    """
+    Start HTTP server immediately; warm Chroma/BM25/reranker/LLM in background.
+
+    Render probes for an open port during startup. Blocking on model/index load
+    (or crashing when chroma_db / processed_chunks.json are missing) prevents
+    the port from ever opening — use deferred init instead.
+    """
     settings = get_settings()
     setup_logging(settings.log_level)
     logger = logging.getLogger(__name__)
-    logger.info("Starting %s v%s", settings.app_name, settings.app_version)
+    logger.info(
+        "Starting %s v%s (chroma=%s chunks=%s)",
+        settings.app_name,
+        settings.app_version,
+        settings.chroma_dir,
+        settings.chunks_path,
+    )
+    print("[boot] FastAPI lifespan: uvicorn will bind; ML init deferred", flush=True)
 
     service = get_rag_service_instance()
-    try:
-        service.initialize()
-        app.state.rag_service = service
-    except Exception as exc:
-        logger.exception("Startup failed: %s", exc)
-        raise
+    app.state.rag_service = service
+
+    init_thread = threading.Thread(
+        target=_background_initialize,
+        args=(service,),
+        name="rag-ml-init",
+        daemon=True,
+    )
+    init_thread.start()
+    logger.info("Background ML init thread started")
 
     yield
 
@@ -161,6 +201,7 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+print("[boot] api.main import complete — FastAPI app ready", flush=True)
 
 
 # =============================================================================

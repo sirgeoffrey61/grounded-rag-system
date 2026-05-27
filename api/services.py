@@ -192,7 +192,13 @@ class RAGService:
 
     def _ensure_ready(self) -> None:
         if not self._initialized:
-            raise RuntimeError("RAG service not initialized. Check application lifespan.")
+            logger.info("Lazy-loading RAG service on first request...")
+            self.initialize()
+        if not self._initialized:
+            raise RuntimeError(
+                "RAG service not initialized. Ensure chroma_db and processed_chunks.json "
+                "exist at configured paths (see /debug/status)."
+            )
 
     def _ensure_llm_ready(self) -> None:
         health = self._check_llm()

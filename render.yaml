@@ -27,3 +27,5 @@ services:
       name: chroma-data
       mountPath: /app/chroma_db
       sizeGB: 1
+    # After first deploy: upload chroma_db/* and processed_chunks.json to the disk
+    # (or set RAG_CHUNKS_PATH to a path under the mounted volume).
